@@ -1,0 +1,199 @@
+name: Secure CI + Build → ECR + Slack (step notifications)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  secure-checks:
+    name: Security scans (notify step-by-step)
+    runs-on: ubuntu-latest
+
+    outputs:
+      scans_ok: ${{ steps.set-scan-status.outputs.scans_ok }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 bandit pip-audit
+      - name: Flake8 (lint, non-blocking)
+        run: flake8 . --exit-zero
+
+      # ----- Bandit (SAST) -----
+      - name: Bandit scan (SAST)
+        id: bandit
+        continue-on-error: true
+        run: |
+          bandit -r . -f json -o bandit.json || true
+
+      - name: Notify Slack — Bandit result
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OUTCOME: ${{ steps.bandit.outcome }}
+        run: |
+          MSG="Bandit scan ($OUTCOME) \\nRepo: $REPO \\nCommit: $SHA \\nRun: $RUN_URL"
+          if [ "$OUTCOME" = "success" ]; then
+            curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"✅ Bandit passed\\n$MSG\"}" "$SLACK_WEBHOOK_URL"
+          else
+            curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"❌ Bandit failed\\n$MSG\"}" "$SLACK_WEBHOOK_URL"
+          fi
+
+      # ----- pip-audit (dependency) -----
+      - name: Dependency scan (pip-audit)
+        id: pipaudit
+        continue-on-error: true
+        run: |
+          pip-audit --format=json > pip_audit.json || true
+
+      - name: Notify Slack — pip-audit result
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OUTCOME: ${{ steps.pipaudit.outcome }}
+        run: |
+          MSG="pip-audit ($OUTCOME) \\nRepo: $REPO \\nCommit: $SHA \\nRun: $RUN_URL"
+          if [ "$OUTCOME" = "success" ]; then
+            curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"✅ pip-audit passed\\n$MSG\"}" "$SLACK_WEBHOOK_URL"
+          else
+            curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"❌ pip-audit failed\\n$MSG\"}" "$SLACK_WEBHOOK_URL"
+          fi
+
+      # ----- Gitleaks (secret scan) -----
+      - name: Secret scan (gitleaks)
+        id: gitleaks
+        uses: zricethezav/gitleaks-action@v2
+        with:
+          args: detect --report-path=gitleaks-report.json
+        continue-on-error: true
+
+      - name: Notify Slack — gitleaks result
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OUTCOME: ${{ steps.gitleaks.outcome }}
+        run: |
+          MSG="gitleaks ($OUTCOME) \\nRepo: $REPO \\nCommit: $SHA \\nRun: $RUN_URL"
+          if [ "$OUTCOME" = "success" ]; then
+            curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"✅ Secret scan passed\\n$MSG\"}" "$SLACK_WEBHOOK_URL"
+          else
+            curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"❌ Secret scan found potential secrets\\n$MSG\"}" "$SLACK_WEBHOOK_URL"
+          fi
+
+      # ----- Summarize scan outcomes and set job output -----
+      - name: Set scans_ok output
+        id: set-scan-status
+        run: |
+          if [ "${{ steps.bandit.outcome }}" = "success" ] && \
+             [ "${{ steps.pipaudit.outcome }}" = "success" ] && \
+             [ "${{ steps.gitleaks.outcome }}" = "success" ]; then
+            echo "scans_ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "scans_ok=false" >> $GITHUB_OUTPUT
+          fi
+
+  docker-build-push:
+    name: Build & Push image → ECR (notified)
+    runs-on: ubuntu-latest
+    needs: secure-checks
+    # only run build if scans succeeded
+    if: needs.secure-checks.outputs.scans_ok == 'true'
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: build_push
+        continue-on-error: true
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REPOSITORY: insecure-flask-app
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Notify Slack — build success
+        if: steps.build_push.outcome == 'success'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          IMAGE: ${{ steps.ecr-login.outputs.registry }}/insecure-flask-app:${{ github.sha }}
+        run: |
+          MSG="Docker build & push succeeded ✅\\nRepo: $REPO\\nImage: $IMAGE\\nCommit: $SHA\\nRun: $RUN_URL"
+          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MSG\"}" "$SLACK_WEBHOOK_URL"
+
+      - name: Notify Slack — build failure
+        if: steps.build_push.outcome == 'failure'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          MSG="Docker build or push FAILED ❌\\nRepo: $REPO\\nCommit: $SHA\\nRun: $RUN_URL"
+          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MSG\"}" "$SLACK_WEBHOOK_URL"
+
+      - name: Fail job if build failed
+        if: steps.build_push.outcome == 'failure'
+        run: |
+          echo "Build failed — stopping pipeline"
+          exit 1
+
+  notify-final:
+    name: Final pipeline notification (summary)
+    runs-on: ubuntu-latest
+    needs: [secure-checks]
+    steps:
+      - name: Final status summary (always)
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SCANS_OK: ${{ needs.secure-checks.outputs.scans_ok }}
+        run: |
+          if [ "$SCANS_OK" = "true" ]; then
+            MSG="Pipeline summary: Security scans passed ✅. Build step was attempted.\\nRepo: $REPO\\nCommit: $SHA\\nRun: $RUN_URL"
+          else
+            MSG="Pipeline summary: Security scans FAILED ❌ — build skipped.\\nRepo: $REPO\\nCommit: $SHA\\nRun: $RUN_URL"
+          fi
+          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MSG\"}" "$SLACK_WEBHOOK_URL"

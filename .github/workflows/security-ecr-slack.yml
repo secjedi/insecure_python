@@ -117,7 +117,6 @@ jobs:
     name: Build & Push image → ECR (notified)
     runs-on: ubuntu-latest
     needs: secure-checks
-    # only run build if scans succeeded
     if: needs.secure-checks.outputs.scans_ok == 'true'
     permissions:
       id-token: write
@@ -133,67 +132,105 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Debug — whoami & region
+        run: |
+          aws sts get-caller-identity
+          echo "AWS Region: $AWS_REGION"
+
       - name: Login to Amazon ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push image
-        id: build_push
+      - name: Check ECR repository exists
+        id: repo_check
         continue-on-error: true
-        env:
-          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          ECR_REPOSITORY: insecure-flask-app
-          IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          aws ecr describe-repositories --repository-names insecure-flask-app >/dev/null 2>&1
 
-      - name: Notify Slack — build success
-        if: steps.build_push.outcome == 'success'
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          IMAGE: ${{ steps.ecr-login.outputs.registry }}/insecure-flask-app:${{ github.sha }}
-        run: |
-          MSG="Docker build & push succeeded ✅\\nRepo: $REPO\\nImage: $IMAGE\\nCommit: $SHA\\nRun: $RUN_URL"
-          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MSG\"}" "$SLACK_WEBHOOK_URL"
-
-      - name: Notify Slack — build failure
-        if: steps.build_push.outcome == 'failure'
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          MSG="Docker build or push FAILED ❌\\nRepo: $REPO\\nCommit: $SHA\\nRun: $RUN_URL"
-          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MSG\"}" "$SLACK_WEBHOOK_URL"
-
-      - name: Fail job if build failed
-        if: steps.build_push.outcome == 'failure'
-        run: |
-          echo "Build failed — stopping pipeline"
-          exit 1
-
-  notify-final:
-    name: Final pipeline notification (summary)
-    runs-on: ubuntu-latest
-    needs: [secure-checks]
-    steps:
-      - name: Final status summary (always)
+      - name: Notify Slack — repo check
         if: always()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          SCANS_OK: ${{ needs.secure-checks.outputs.scans_ok }}
         run: |
-          if [ "$SCANS_OK" = "true" ]; then
-            MSG="Pipeline summary: Security scans passed ✅. Build step was attempted.\\nRepo: $REPO\\nCommit: $SHA\\nRun: $RUN_URL"
+          if [ "${{ steps.repo_check.outcome }}" = "success" ]; then
+            MSG="ECR repo check ✅ found 'insecure-flask-app'\nRepo: $REPO\nCommit: $SHA\nRun: $RUN_URL"
           else
-            MSG="Pipeline summary: Security scans FAILED ❌ — build skipped.\\nRepo: $REPO\\nCommit: $SHA\\nRun: $RUN_URL"
+            MSG="ECR repo check ❌ repository 'insecure-flask-app' not found or no permission\nRepo: $REPO\nCommit: $SHA\nRun: $RUN_URL"
           fi
           curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MSG\"}" "$SLACK_WEBHOOK_URL"
+
+      - name: Build image
+        id: build
+        continue-on-error: true
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REPOSITORY: insecure-flask-app
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -o pipefail
+          echo "Building $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker build --progress=plain -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG . 2>&1 | tee build.log
+
+      - name: Notify Slack — build result
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "${{ steps.build.outcome }}" = "success" ]; then
+            MSG="Docker build ✅\nRepo: $REPO\nCommit: $SHA\nRun: $RUN_URL"
+          else
+            MSG="Docker build ❌ (see build.log artifact)\nRepo: $REPO\nCommit: $SHA\nRun: $RUN_URL"
+          fi
+          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MSG\"}" "$SLACK_WEBHOOK_URL"
+
+      - name: Push image
+        id: push
+        continue-on-error: true
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REPOSITORY: insecure-flask-app
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -o pipefail
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG 2>&1 | tee push.log
+
+      - name: Notify Slack — push result
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "${{ steps.push.outcome }}" = "success" ]; then
+            IMAGE="${{ steps.ecr-login.outputs.registry }}/insecure-flask-app:${{ github.sha }}"
+            MSG="Docker push ✅\nImage: $IMAGE\nRepo: $REPO\nCommit: $SHA\nRun: $RUN_URL"
+          else
+            MSG="Docker push ❌ (see push.log artifact)\nRepo: $REPO\nCommit: $SHA\nRun: $RUN_URL"
+          fi
+          curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MSG\"}" "$SLACK_WEBHOOK_URL"
+
+      - name: Upload Docker logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-logs
+          path: |
+            build.log
+            push.log
+
+      - name: Fail job if build or push failed
+        if: always()
+        run: |
+          if [ "${{ steps.repo_check.outcome }}" != "success" ] || \
+             [ "${{ steps.build.outcome }}" != "success" ] || \
+             [ "${{ steps.push.outcome }}" != "success" ]; then
+            echo "Build/Push failed — stopping pipeline"
+            exit 1
+          fi
